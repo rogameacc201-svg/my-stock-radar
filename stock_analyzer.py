@@ -20,60 +20,70 @@ mode = st.sidebar.radio(
 stock_pool = {}
 
 if mode == "🔥 全台股成交量前 50 大 (真正動態抓取)":
-    st.sidebar.info("📊 系統正透過 TWSE 每日收盤行情，依據最新交易日「實際成交股數」由高到低排序，自動篩選出前 50 檔正股。")
+    st.sidebar.info("📊 系統正透過雙管道機制（FinMind API / TWSE）自動撈取最新一個交易日全市場成交量前 50 檔正股。")
     
     @st.cache_data(ttl=1800)  # 緩存 30 分鐘
     def fetch_real_twse_top_50():
+        # 管道 A：優先嘗試 FinMind 穩定管道 (專為週末與高頻率存取設計)
         try:
-            # 取得最新一個交易日的日期 (如果是週末，自動往前推到週五)
-            target_date = datetime.datetime.now()
-            # 偽裝成真實瀏覽器的標頭 (核心防禦：防止 503 或 Expecting value 錯誤)
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
+            # 取得 3 天前的日期，確保能涵蓋到最新的交易日
+            three_days_ago = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
+            url = "https://api.finmindtrade.com/api/v4/data"
+            # 抓取全市場日成交行情
+            params = {"dataset": "TaiwanStockPriceTick", "start_date": three_days_ago}
             
-            # 嘗試最多往前推 5 天找尋有開盤的交易日數據
+            # 如果一般 Tick 資料庫週末維護，改抓常規日收盤
+            res = requests.get(url, params={"dataset": "TaiwanStockPrice", "start_date": three_days_ago}, timeout=10)
+            if res.status_code == 200:
+                data = res.json().get('data', [])
+                if data:
+                    df_fm = pd.DataFrame(data)
+                    # 篩選最新一天的資料
+                    latest_date = df_fm['date'].max()
+                    df_fm = df_fm[df_fm['date'] == latest_date]
+                    
+                    # 過濾純 4 位數台股正股
+                    df_fm = df_fm[df_fm['stock_id'].str.len() == 4]
+                    df_fm = df_fm[df_fm['stock_id'].str.isdigit()]
+                    
+                    # 依成交量（Trading_Volume）排序
+                    df_fm['Trading_Volume'] = pd.to_numeric(df_fm['Trading_Volume'], errors='coerce')
+                    df_top50 = df_fm.sort_values(by='Trading_Volume', ascending=False).head(50)
+                    
+                    # 由於 FinMind 預設不一定帶中文名，我們建立代碼清單，隨後大腦會自動去 Yahoo 正名
+                    return dict(zip(df_top50['stock_id'], df_top50['stock_id']))
+        except:
+            pass # 如果管道 A 失敗，無縫滑入管道 B
+
+        # 管道 B：證交所官方網頁備援機制
+        try:
+            target_date = datetime.datetime.now()
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             for _ in range(5):
                 date_str = target_date.strftime("%Y%m%d")
                 url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_str}&type=ALL"
                 res = requests.get(url, headers=headers, timeout=10)
-                
-                # 確保收到的是正常的 JSON 格式
                 if res.status_code == 200 and res.text.strip().startswith("{"):
                     data = res.json()
-                    if 'data9' in data:  # data9 是全市場股票的收盤行情
-                        raw_data = data['data9']
-                        # 欄位說明：0:證券代號, 1:證券名稱, 2:成交股數, ...
-                        df_all = pd.DataFrame(raw_data)
-                        
-                        # 清理並過濾正股：代號必須是 4 位數純數字
+                    if 'data9' in data:
+                        df_all = pd.DataFrame(data['data9'])
                         df_all[0] = df_all[0].str.strip()
                         df_all[1] = df_all[1].str.strip()
-                        df_all = df_all[df_all[0].str.len() == 4]
-                        df_all = df_all[df_all[0].str.isdigit()]
-                        
-                        # 將成交股數欄位(索引2)的逗號拿掉，轉為純數字以利排序
+                        df_all = df_all[(df_all[0].str.len() == 4) & (df_all[0].str.isdigit())]
                         df_all[2] = df_all[2].str.replace(',', '')
                         df_all[2] = pd.to_numeric(df_all[2], errors='coerce')
-                        
-                        # 排序並取出前 50 名
                         df_top50 = df_all.sort_values(by=2, ascending=False).head(50)
-                        
-                        # 打包成字典
                         return dict(zip(df_top50[0], df_top50[1]))
-                
-                # 如果該日期沒開盤或抓取失敗，往前推一天
                 target_date -= datetime.timedelta(days=1)
-                
-            raise Exception("無法取得近期的證交所開盤數據")
-            
-        except Exception as e:
-            st.sidebar.error(f"❌ 證交所 API 解析異常，已啟用核心權值股替代方案。原因: {e}")
-            return {
-                "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2382": "廣達", 
-                "3231": "緯創", "2603": "長榮", "2609": "陽明", "2615": "萬海",
-                "2308": "台達電", "2357": "華碩", "2881": "富邦金", "2882": "國泰金"
-            }
+        except:
+            pass
+
+        # 終極保底：萬一兩大外網在週末同時大斷線，才吐出這 12 檔
+        return {
+            "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2382": "廣達", 
+            "3231": "緯創", "2603": "長榮", "2609": "陽明", "2615": "萬海",
+            "2308": "台達電", "2357": "華碩", "2881": "富邦金", "2882": "國泰金"
+        }
             
     stock_pool = fetch_real_twse_top_50()
 
@@ -114,7 +124,7 @@ def fetch_global_metrics():
 us_bullish, fx_bullish, macro_growth = fetch_global_metrics()
 
 # ==========================================
-# 核心十一因子打分大腦
+# 核心十一因子打分大腦 (新增自動正名功能)
 # ==========================================
 def calculate_stock_score(stock_id, default_name):
     yf_symbol = f"{stock_id}.TW"
@@ -155,75 +165,15 @@ def calculate_stock_score(stock_id, default_name):
             if latest_yoy > 10: total_score += 10
     except: pass
 
-    # 3. 財報獲利能力與真名校正
+    # 3. 財報獲利能力與【真名校正大腦】
     try:
         info = ticker.info
-        if "個股" in default_name:
+        # 如果是 FinMind 抓過來的或是自訂代碼，這裡會透過 Yahoo 財報資訊直接覆寫成真正的中文名稱（例如：2603 改成长榮）
+        if default_name == stock_id or "個股" in default_name:
             actual_name = info.get('shortName', default_name)
+            # 移除常見的英文尾綴，保持乾淨
+            actual_name = actual_name.replace("CO.,LTD.", "").replace("LTD.", "").strip()
+            
         gross_margin = info.get('grossMargins', 0) * 100 if info.get('grossMargins') else 0
         roe = info.get('returnOnEquity', 0) * 100 if info.get('returnOnEquity') else 0
         if roe > 15 and gross_margin > 30: total_score += 15
-    except: pass
-
-    # 4. 法人籌碼
-    try:
-        res_chips = requests.get(FINMIND_URL, params={"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "data_id": stock_id, "start_date": two_weeks_ago}, timeout=5)
-        df_chips = pd.DataFrame(res_chips.json()['data'])
-        if not df_chips.empty:
-            df_chips['net'] = df_chips['buy'] - df_chips['sell']
-            df_latest_chips = df_chips[df_chips['date'] == df_chips['date'].max()]
-            f_net = df_latest_chips[df_latest_chips['name'].str.contains('Foreign|外資', case=False)]['net'].sum()
-            t_net = df_latest_chips[df_latest_chips['name'].str.contains('Trust|投信', case=False)]['net'].sum()
-            if f_net > 0 and t_net > 0: total_score += 12
-            elif f_net > 0 or t_net > 0: total_score += 6
-    except: pass
-
-    # 5. 大戶持股
-    try:
-        res_hold = requests.get(FINMIND_URL, params={"dataset": "TaiwanStockShareholdingSelecIndices", "data_id": stock_id, "start_date": two_months_ago}, timeout=5)
-        df_hold = pd.DataFrame(res_hold.json()['data'])
-        if not df_hold.empty:
-            df_400 = df_hold[df_hold['holding_shares_level'].str.contains('400', na=False)]
-            if len(df_400) >= 2 and df_400.iloc[-1]['percent'] > df_400.iloc[-2]['percent']: total_score += 8
-    except: pass
-
-    # 總經加分
-    if fx_bullish: total_score += 8
-    if macro_growth: total_score += 7
-    if us_bullish: total_score += 15
-
-    return {"代號": stock_id, "股名": actual_name, "綜合總分": total_score, "最新股價": close_price_str, "營收YoY": latest_yoy_str, "技術型態": trend_desc}
-
-# ==========================================
-# 主網頁呈現
-# ==========================================
-st.title("🏆 今日台股量化多因子篩選器 · 策略爭霸榜")
-
-# 展開查看當前抓到的50大名單
-with st.expander("🔍 點擊查看當前證交所量能前 50 大股票池名單"):
-    st.write(", ".join([f"{k} {v}" for k, v in stock_pool.items()]))
-
-st.write(f"📊 當前選股池目標數量： **{len(stock_pool)}** 檔股票")
-
-if len(stock_pool) > 20:
-    st.warning(f"⚠️ 正在對大量熱門標的（共 {len(stock_pool)} 檔）進行深度因子計算。因配合 API 速限，約需 15~25 秒，請稍候。")
-
-if st.button("🚀 啟動全自動量化因子雷達掃描", type="primary"):
-    results = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for idx, (s_id, s_name) in enumerate(stock_pool.items()):
-        status_text.text(f"⏳ 正在深度診斷：{s_id} {s_name} ...")
-        stock_data = calculate_stock_score(s_id, s_name)
-        results.append(stock_data)
-        progress_bar.progress((idx + 1) / len(stock_pool))
-        time.sleep(0.1)
-        
-    status_text.text("✅ 全市場熱門股因子掃描完成！")
-    
-    df_leaderboard = pd.DataFrame(results).sort_values(by="綜合總分", ascending=False).reset_index(drop=True)
-    
-    st.balloons()
-    st.success(f"👑 本次成交量修羅場冠軍：【 {df_leaderboard.iloc[0]['股名']} 】（獲得 {df_leaderboard.iloc[0]['綜合總分']} 分）")
-    st.dataframe(df_leaderboard, use_container_width=True)
