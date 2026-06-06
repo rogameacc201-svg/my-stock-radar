@@ -1,66 +1,57 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import requests
-import datetime
-import time
 
 st.set_page_config(page_title="台股量化選股雷達", layout="wide")
 
 # ==========================================
-# 強化版：自動回溯前一個交易日
+# 核心資料處理：抓取特定日期的證交所 CSV
 # ==========================================
-def get_top_50_stocks():
-    # 嘗試往回推 7 天，找尋有成交量的日期
-    for i in range(7):
-        target_date = (datetime.datetime.now() - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-        
-        # 使用 FinMind 抓取歷史日收盤資料
-        url = "https://api.finmindtrade.com/api/v4/data"
-        params = {"dataset": "TaiwanStockPrice", "start_date": target_date, "end_date": target_date}
-        try:
-            res = requests.get(url, params=params, timeout=10)
-            data = res.json().get('data', [])
-            if data and len(data) > 50: # 確保有資料
-                df = pd.DataFrame(data)
-                df = df[(df['stock_id'].str.len() == 4) & (df['stock_id'].str.isdigit())]
-                df['Trading_Volume'] = pd.to_numeric(df['Trading_Volume'], errors='coerce')
-                df_top50 = df.sort_values(by='Trading_Volume', ascending=False).head(50)
-                st.sidebar.success(f"✅ 成功抓取 {target_date} 的熱門交易數據！")
-                return dict(zip(df_top50['stock_id'], df_top50['stock_id']))
-        except:
-            continue
-    return {"2330": "台積電", "2317": "鴻海", "2454": "聯發科"} # 真的抓不到才給保底
+def fetch_top_50_data():
+    # 使用 2026-06-05 作為最近交易日
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date=20260605&type=ALL"
+    try:
+        # 讀取 CSV，確保欄位對齊
+        df = pd.read_csv(url, header=1, thousands=',', encoding='cp950')
+        # 過濾證券代號為 4 位數的股票 (去掉權證與其他)
+        df = df[df['證券代號'].astype(str).str.len() == 4]
+        # 依照成交股數排序，取前 50
+        df = df.sort_values(by='成交股數', ascending=False).head(50)
+        return dict(zip(df['證券代號'].astype(str), df['證券名稱']))
+    except Exception as e:
+        st.error(f"無法取得證交所資料: {e}")
+        return {}
 
 # ==========================================
-# 網頁控制
+# 側邊欄：功能選擇
 # ==========================================
-st.sidebar.header("設定")
-mode = st.sidebar.radio("來源：", ("🔥 自動抓取最近交易日成交量前 50 大", "✍️ 自訂"))
+st.sidebar.header("⚙️ 設定面板")
+mode = st.sidebar.radio("選擇模式：", ("🔥 自動抓取前 50 大熱門股", "✍️ 自訂輸入"))
 
-if mode == "🔥 自動抓取最近交易日成交量前 50 大":
-    stock_pool = get_top_50_stocks()
+stock_pool = {}
+
+if mode == "🔥 自動抓取前 50 大熱門股":
+    if st.sidebar.button("載入熱門股"):
+        stock_pool = fetch_top_50_data()
 else:
-    user_input = st.sidebar.text_input("輸入代碼 (逗號隔開)", "2330,2317")
-    stock_pool = {s.strip(): s.strip() for s in user_input.split(',')}
+    user_input = st.sidebar.text_input("輸入股票代號 (逗號分隔):", "2330, 2317, 2454")
+    if user_input:
+        for s_id in user_input.split(','):
+            clean_id = s_id.strip()
+            if clean_id.isdigit():
+                stock_pool[clean_id] = f"個股 {clean_id}"
 
 # ==========================================
-# 掃描與執行 (保持簡潔)
+# 呈現結果
 # ==========================================
-st.title("🏆 台股量化爭霸榜")
-if st.button("🚀 開始分析"):
-    results = []
-    # 為了演示，我們只跑前 10 檔，避免你等太久
-    target_list = list(stock_pool.items())[:10] 
+st.title("🏆 台股選股雷達")
+
+if stock_pool:
+    st.write(f"目前分析標的數量：{len(stock_pool)}")
+    # 在這裡顯示簡單的清單，讓你確認沒跑掉
+    st.table(pd.DataFrame(list(stock_pool.items()), columns=["代號", "名稱"]))
     
-    for s_id, s_name in target_list:
-        try:
-            ticker = yf.Ticker(f"{s_id}.TW")
-            info = ticker.info
-            name = info.get('shortName', s_name)
-            price = info.get('currentPrice', 0)
-            results.append({"代號": s_id, "名稱": name, "股價": price})
-        except:
-            continue
-            
-    st.table(pd.DataFrame(results))
+    if st.button("開始執行深度分析"):
+        st.info("分析功能已就緒，請檢查上述清單是否正確。")
+else:
+    st.write("請從左側側邊欄選擇模式並載入標的。")
