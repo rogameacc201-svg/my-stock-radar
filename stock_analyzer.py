@@ -20,34 +20,55 @@ mode = st.sidebar.radio(
 stock_pool = {}
 
 if mode == "🔥 全台股成交量前 50 大 (真正動態抓取)":
-    st.sidebar.info("📊 系統正透過 TWSE OpenAPI 撈取全市場上千檔標的，並依據當日「實際成交股數」由高到低排序，自動篩選出前 50 檔正股。")
+    st.sidebar.info("📊 系統正透過 TWSE 每日收盤行情，依據最新交易日「實際成交股數」由高到低排序，自動篩選出前 50 檔正股。")
     
     @st.cache_data(ttl=1800)  # 緩存 30 分鐘
     def fetch_real_twse_top_50():
         try:
-            # 使用最穩定的證交所開放數據源
-            url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-            data = res.json()
+            # 取得最新一個交易日的日期 (如果是週末，自動往前推到週五)
+            target_date = datetime.datetime.now()
+            # 偽裝成真實瀏覽器的標頭 (核心防禦：防止 503 或 Expecting value 錯誤)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
             
-            # 轉換為 DataFrame 進行就地排序
-            df_all = pd.DataFrame(data)
+            # 嘗試最多往前推 5 天找尋有開盤的交易日數據
+            for _ in range(5):
+                date_str = target_date.strftime("%Y%m%d")
+                url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_str}&type=ALL"
+                res = requests.get(url, headers=headers, timeout=10)
+                
+                # 確保收到的是正常的 JSON 格式
+                if res.status_code == 200 and res.text.strip().startswith("{"):
+                    data = res.json()
+                    if 'data9' in data:  # data9 是全市場股票的收盤行情
+                        raw_data = data['data9']
+                        # 欄位說明：0:證券代號, 1:證券名稱, 2:成交股數, ...
+                        df_all = pd.DataFrame(raw_data)
+                        
+                        # 清理並過濾正股：代號必須是 4 位數純數字
+                        df_all[0] = df_all[0].str.strip()
+                        df_all[1] = df_all[1].str.strip()
+                        df_all = df_all[df_all[0].str.len() == 4]
+                        df_all = df_all[df_all[0].str.isdigit()]
+                        
+                        # 將成交股數欄位(索引2)的逗號拿掉，轉為純數字以利排序
+                        df_all[2] = df_all[2].str.replace(',', '')
+                        df_all[2] = pd.to_numeric(df_all[2], errors='coerce')
+                        
+                        # 排序並取出前 50 名
+                        df_top50 = df_all.sort_values(by=2, ascending=False).head(50)
+                        
+                        # 打包成字典
+                        return dict(zip(df_top50[0], df_top50[1]))
+                
+                # 如果該日期沒開盤或抓取失敗，往前推一天
+                target_date -= datetime.timedelta(days=1)
+                
+            raise Exception("無法取得近期的證交所開盤數據")
             
-            # 1. 關鍵清洗：只留 4 位數的純數字股票（精準過濾權證、六碼特種 ETF、特別股）
-            df_all = df_all[df_all['Code'].str.len() == 4]
-            df_all = df_all[df_all['Code'].str.isdigit()]
-            
-            # 2. 將成交股數（TradeVolume）轉為數字型態以利排序
-            df_all['TradeVolume'] = pd.to_numeric(df_all['TradeVolume'], errors='coerce')
-            
-            # 3. 依照成交量大到小排序，並切出前 50 名
-            df_top50 = df_all.sort_values(by='TradeVolume', ascending=False).head(50)
-            
-            # 4. 打包成字典型態 { "代碼": "股名" }
-            pool = dict(zip(df_top50['Code'], df_top50['Name']))
-            return pool
         except Exception as e:
-            st.sidebar.error(f"❌ 證交所 API 連線異常，暫時啟用核心權值股替代方案。錯誤原因: {e}")
+            st.sidebar.error(f"❌ 證交所 API 解析異常，已啟用核心權值股替代方案。原因: {e}")
             return {
                 "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2382": "廣達", 
                 "3231": "緯創", "2603": "長榮", "2609": "陽明", "2615": "萬海",
@@ -197,7 +218,7 @@ if st.button("🚀 啟動全自動量化因子雷達掃描", type="primary"):
         stock_data = calculate_stock_score(s_id, s_name)
         results.append(stock_data)
         progress_bar.progress((idx + 1) / len(stock_pool))
-        time.sleep(0.1) # 禮貌延遲
+        time.sleep(0.1)
         
     status_text.text("✅ 全市場熱門股因子掃描完成！")
     
